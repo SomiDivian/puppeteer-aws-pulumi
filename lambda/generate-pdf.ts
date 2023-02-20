@@ -1,0 +1,166 @@
+import type { Readable } from "stream";
+import type {
+  Pool,
+  Options as PoolOptions,
+  Factory as PoolFactory,
+} from "generic-pool";
+import { createPool } from "generic-pool";
+import type { Browser, Page, PDFOptions } from "puppeteer-core";
+
+import chromium from "@sparticuz/chromium-min";
+import puppeteer from "puppeteer-core";
+
+interface PageInstance {
+  browser: Browser;
+  page: Page;
+}
+
+const s3FilePath = "";
+// ex: https://[bucketName].s3.[region].amazonaws.com/chromium-v110.0.0-pack.tar";
+
+class PageFactory implements PoolFactory<PageInstance> {
+  constructor(protected puppeteerArgs?: string[]) {}
+  async create(): Promise<PageInstance> {
+    const browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(s3FilePath),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
+    });
+
+    return {
+      browser: browser as unknown as Browser,
+      page: (await browser.newPage()) as unknown as Page,
+    };
+  }
+
+  async destroy(client: PageInstance): Promise<void> {
+    try {
+      if (client.browser.isConnected()) {
+        await client.browser.close();
+      }
+    } catch {
+      return;
+    }
+  }
+
+  async validate(client: PageInstance): Promise<boolean> {
+    try {
+      return !!(await client.page.metrics());
+    } catch {
+      return false;
+    }
+  }
+}
+
+export class PdfGenerator {
+  protected pagesPool: Pool<PageInstance>;
+
+  /**
+   * @param poolConfig https://github.com/coopernurse/node-pool/blob/1c5cb79dcbea27c4b1839bd75bfc41274adb8b94/lib/PoolOptions.js#L5
+   * @param puppeteerArgs https://peter.sh/experiments/chromium-command-line-switches/
+   */
+  constructor(
+    poolConfig: PoolOptions = { min: 1, max: 10 },
+    puppeteerArgs?: string[]
+  ) {
+    this.pagesPool = createPool(new PageFactory(puppeteerArgs), {
+      testOnBorrow: true, // Should the pool validate resources before giving them to clients
+      evictionRunIntervalMillis: 5000,
+      ...poolConfig,
+      autostart: true,
+    });
+  }
+
+  async stop() {
+    await this.pagesPool.drain();
+    await this.pagesPool.clear();
+  }
+
+  async awaitPool() {
+    return this.pagesPool.ready();
+  }
+
+  generatePDF(htmlOrUrl: string | URL): Promise<Buffer>;
+  generatePDF(
+    htmlOrUrl: string | URL,
+    stream: undefined,
+    pdfOptions?: PDFOptions
+  ): Promise<Buffer>;
+  generatePDF(
+    htmlOrUrl: string | URL,
+    stream: false,
+    pdfOptions?: PDFOptions
+  ): Promise<Buffer>;
+  generatePDF(
+    htmlOrUrl: string | URL,
+    stream: true,
+    pdfOptions?: PDFOptions
+  ): Promise<Readable>;
+  public async generatePDF(
+    htmlOrUrl: string | URL,
+    stream = false,
+    pdfOptions?: PDFOptions
+  ): Promise<Readable | Buffer> {
+    const page = await this.pagesPool.acquire();
+
+    try {
+      if (htmlOrUrl instanceof URL) {
+        await page.page.goto(htmlOrUrl.toString(), {
+          waitUntil: "networkidle0",
+        });
+      } else {
+        await page.page.setContent(htmlOrUrl, { waitUntil: "networkidle0" });
+      }
+
+      //To reflect CSS used for screens instead of print
+      await page.page.emulateMediaType("print");
+    } catch (e) {
+      await this.pagesPool.release(page);
+      throw e;
+    }
+
+    const options: PDFOptions = pdfOptions || {
+      margin: { top: "100px", right: "50px", bottom: "100px", left: "50px" },
+      format: "A4",
+    };
+
+    if (!stream) {
+      try {
+        const res = await page.page.pdf(options);
+        await this.pagesPool.release(page);
+        return res;
+      } catch (e) {
+        await this.pagesPool.destroy(page);
+        throw e;
+      }
+    }
+
+    try {
+      let released = false;
+      return (await page.page.createPDFStream(options))
+        .once("error", () => {
+          if (!released) {
+            released = true;
+            this.pagesPool.destroy(page).catch(() => undefined);
+          }
+        })
+        .once("close", () => {
+          if (!released) {
+            released = true;
+            this.pagesPool.release(page).catch(() => undefined);
+          }
+        })
+        .once("end", () => {
+          if (!released) {
+            released = true;
+            this.pagesPool.release(page).catch(() => undefined);
+          }
+        });
+    } catch (e) {
+      await this.pagesPool.destroy(page).catch(() => undefined);
+      throw e;
+    }
+  }
+}
